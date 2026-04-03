@@ -30,7 +30,9 @@ nicholascabrera@localhost:~>
 There is a bugzilla report on KDE for this [here](https://bugs.kde.org/show_bug.cgi?id=485085). 
 
 ## Past PRs
-Several PRs have been made for `KScreenLocker` that would have fixed the issue - but it's my opinion and also I think the opinion of the KScreenLocker team that KScreenLocker is not where this code should be. This race condition is not the responsibility of KDE, X11, OR systemd. All packages are acting exactly as they should be - with a collaboration failure between them all (notoriously difficult to collaborate between such large organizations).
+Several PRs have been made for `KScreenLocker` that would have fixed the issue - but it's my opinion and also I think the opinion of the KScreenLocker team that KScreenLocker is not where this code should be. This race condition is not the responsibility of KDE, X11, OR systemd. All packages are acting exactly as they should be - with a collaboration failure between them all (notoriously difficult to collaborate between such large organizations). They can be found here:
+- [PR 290](https://invent.kde.org/plasma/kscreenlocker/-/merge_requests/290)
+- [PR 289](https://invent.kde.org/plasma/kscreenlocker/-/merge_requests/289)
 
 # Future Enhancements
 I plan to make some future enhancements to the script, such as using a native DBus call to logind rather than a system call, locking specific sessions, handling multiple signals, user configuration for delay tuning, and (non)verbose logging.

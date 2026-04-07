@@ -3,7 +3,6 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
-#include <fcntl.h>
 #include <time.h>
 
 #define TRUE 1
@@ -53,36 +52,36 @@ typedef struct {
     uint64_t lock_request_time;
 } application_context_t;
 
-// Function to check if the queue is empty
-int no_signals(signal_queue_t *q) {
-    if ((q->head == q->tail - 1)){
-        return TRUE;
+static void pvprintf(config_t *c, char *s[]) {
+    if (c->verbose) {
+        printf(s);
     }
-    return FALSE;
+}
+
+// Function to check if the queue is empty
+static int no_signals(signal_queue_t *q) {
+    return q->head == q->tail;
 }
 
 // Function to check if the queue is full
-int max_signals_received(signal_queue_t *q) {
-    if(q->tail == MAX_SIGNALS) {
-        return TRUE;
-    }
-    return FALSE;
+static int max_signals_received(signal_queue_t *q) {
+    return ((q->tail + 1) % MAX_SIGNALS) == q->head;
 }
 
 // Function to add an element to the queue (Enqueue
 // operation)
-void enqueue_signal(signal_queue_t *q, signal_t s) {
+static void enqueue_signal(signal_queue_t *q, signal_t s) {
     if (max_signals_received(q)) {
         printf("Signal queue is full\n");
         return;
     }
     q->signals[q->tail] = s;
-    q->tail++;
+    q->tail = (q->tail + 1) % MAX_SIGNALS;
 }
 
 // Function to remove an element from the queue (Dequeue
 // operation)
-int dequeue_signal(signal_queue_t *q, signal_t *s) {
+static int dequeue_signal(signal_queue_t *q, signal_t *s) {
     if (no_signals(q)) {
         printf("Signal queue is empty\n");
         return 0;
@@ -154,12 +153,12 @@ static int properties_changed_handler(sd_bus_message *m, void *userdata, sd_bus_
     return 0;
 }
 
-static int prepare_for_sleep_handler(sd_bus_message *msg, void *userdata, sd_bus_error *ret_error) {
+static int prepare_for_sleep_handler(sd_bus_message *m, void *userdata, sd_bus_error *ret_error) {
     application_context_t *app = userdata;
     int sleeping;
     int response;
 
-    response = sd_bus_message_read(msg, "b", &sleeping);
+    response = sd_bus_message_read(m, "b", &sleeping);
     if (response < 0) {
         fprintf(stderr, "Failed to parse parameters: %s\n", strerror(-response));
         return response;
@@ -197,8 +196,11 @@ static int acquire_inhibitor(application_context_t *app) {
     if (response < 0) {
         fprintf(stderr, "Failed to issue method call: %s\n", error.message);
         sd_bus_error_free(&error);
+        sd_bus_message_unref(m);
         return response;
     }
+
+    sd_bus_error_free(&error);
 
     // Read returned file descriptor
     response = sd_bus_message_read(m, "h", &fd);
@@ -208,7 +210,7 @@ static int acquire_inhibitor(application_context_t *app) {
         return response;
     }
 
-    app->inhibitor_lock_fd = fd;
+    app->inhibitor_lock_fd = dup(fd);
 
     printf("[INFO] Inhibitor acquired (fd=%d)\n", app->inhibitor_lock_fd);
 
@@ -234,6 +236,8 @@ static int lock_session(application_context_t *app) {
 
     if (response < 0){
         fprintf(stderr, "Failed to issue method call: %s\n", error.message);
+        sd_bus_error_free(&error);
+        sd_bus_message_unref(m);
         return response;
     }
 
@@ -243,7 +247,7 @@ static int lock_session(application_context_t *app) {
 }
 
 static int setup(application_context_t *app){
-    int sid = getenv("XDG_SESSION_ID");
+    const char *sid = getenv("XDG_SESSION_ID");
 
     if (!sid) {
         fprintf(stderr, "XDG_SESSION_ID not set...\n");
@@ -253,7 +257,9 @@ static int setup(application_context_t *app){
     }
 
     app->session_id = sid;
-    app->session_path = "/org/freedesktop/login1/session/" + sid;
+    char *path = malloc(128);
+    snprintf(path, 128, "/org/freedesktop/login1/session/%s", sid);
+    app->session_path = path;
     app->bus = NULL;
     app->state = STATE_ACQUIRE_INHIBITOR;
     app->inhibitor_lock_fd = -1;
@@ -266,7 +272,7 @@ static int setup(application_context_t *app){
     app->config = config;
 
     signal_queue_t queue;
-    queue.head = -1;
+    queue.head = 0;
     queue.tail = 0;
 
     app->queue = queue;
@@ -368,23 +374,25 @@ static void handle_signal(application_context_t *app, signal_t *s) {
  * I need to register a match rule for Lock in the current session (confirm lock)
  */
 int main(int argc, char *argv[]) {
-    application_context_t *app;
+    application_context_t app = {0};
 
-    setup(app);
+    setup(&app);
 
     // the daemon event loop
     while(1) {
         // process our DBus messages, trigger callbacks, enqueue/dequeue signals
-        sd_bus_process(app->bus, NULL);
+        sd_bus_process(app.bus, NULL);
 
         // send new signals to handle_signals
         signal_t signal;
-        while (dequeue_signal(&app->queue, &signal)){
-            handle_signal(app, &signal);
+        while (dequeue_signal(&app.queue, &signal)){
+            handle_signal(&app, &signal);
         }
+
+        sd_bus_wait(app.bus, (uint64_t)-1);
     }
 
     // clean up
-    sd_bus_unref(app->bus);
+    sd_bus_unref(app.bus);
     return 0;
 }

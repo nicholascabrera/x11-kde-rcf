@@ -1,9 +1,11 @@
 #include <systemd/sd-bus.h>
+#include <systemd/sd-login.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
 #include <time.h>
+#include <syslog.h>
 
 #define TRUE 1
 #define FALSE 0
@@ -25,7 +27,9 @@ typedef enum {
 } signal_t;
 
 typedef struct {
+    int lock_delay_s;
     int lock_delay_ms;
+    int timeout_s;
     int timeout_ms;
     int verbose;
 } config_t;
@@ -39,7 +43,8 @@ typedef struct {
 } signal_queue_t;
 
 typedef struct {
-    sd_bus *bus;
+    sd_bus *system_bus;
+    sd_bus *user_bus;
     int inhibitor_lock_fd;
     
     state_t state;
@@ -52,20 +57,23 @@ typedef struct {
     uint64_t lock_request_time;
 } application_context_t;
 
-static void pvprintf_state(config_t *c, char *s[]) {
+static void pvprintf_state(config_t *c, const char *s) {
     if (c->verbose) {
-        fprintf("[STATE] %s\n", s);
+        syslog(LOG_INFO, "[STATE] %s", s);
+        fprintf(stdout, "[STATE] %s\n", s);
     }
 }
 
-static void pvprintf_info(config_t *c, char *s[]) {
+static void pvprintf_info(config_t *c, const char *s) {
     if (c->verbose) {
-        fprintf("[INFO] %s\n", s);
+        syslog(LOG_INFO, "[INFO] %s", s);
+        fprintf(stdout, "[INFO] %s\n", s);
     }
 }
 
-static void pvprintf_error(config_t *c, char *s[], int error) {
+static void pvprintf_error(config_t *c, const char *s, int error) {
     if (c->verbose) {
+        syslog(LOG_ERR, "[ERROR] %s", s);
         fprintf(stderr, "[ERROR] %s: %s\n", s, strerror(error));
     }
 }
@@ -170,6 +178,8 @@ static int prepare_for_sleep_handler(sd_bus_message *m, void *userdata, sd_bus_e
     int sleeping;
     int response;
 
+    printf("[DEBUG] PrepareForSleep signal received\n");
+
     response = sd_bus_message_read(m, "b", &sleeping);
     if (response < 0) {
         pvprintf_error(&app->config, "Failed to parse parameters", -response);
@@ -185,6 +195,53 @@ static int prepare_for_sleep_handler(sd_bus_message *m, void *userdata, sd_bus_e
     return 0;
 }
 
+static int get_active_session(application_context_t *app) {
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    sd_bus_message *m = NULL;
+
+    int r = sd_bus_call_method(
+        app->system_bus,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+        "ListSessions",
+        &error,
+        &m,
+        NULL
+    );
+
+    if (r < 0) {
+        fprintf(stderr, "ListSessions failed: %s\n", error.message);
+        return r;
+    }
+
+    r = sd_bus_message_enter_container(m, 'a', "(susso)");
+    if (r < 0) return r;
+
+    while ((r = sd_bus_message_enter_container(m, 'r', "susso")) > 0) {
+        const char *sid, *user, *seat, *path;
+        uint32_t uid;
+
+        r = sd_bus_message_read(m, "susso", &sid, &uid, &user, &seat, &path);
+        if (r < 0) return r;
+
+        if (strcmp(seat, "seat0") == 0) {
+            app->session_id = strdup(sid);
+            app->session_path = strdup(path);
+
+            printf("[INFO] Using session %s (%s)\n", sid, path);
+
+            sd_bus_message_exit_container(m);
+            break;
+        }
+
+        sd_bus_message_exit_container(m);
+    }
+
+    sd_bus_message_unref(m);
+    return 0;
+}
+
 static int acquire_inhibitor(application_context_t *app) {
     sd_bus_error error = SD_BUS_ERROR_NULL;
     sd_bus_message *m = NULL;
@@ -192,10 +249,11 @@ static int acquire_inhibitor(application_context_t *app) {
 
     if (app->inhibitor_lock_fd >= 0) {
         close(app->inhibitor_lock_fd);
+        app->inhibitor_lock_fd = -1;
     }
 
     int response = sd_bus_call_method(
-        app->bus,
+        app->system_bus,
         "org.freedesktop.login1",
         "/org/freedesktop/login1",
         "org.freedesktop.login1.Manager",
@@ -206,11 +264,11 @@ static int acquire_inhibitor(application_context_t *app) {
         "sleep",
         "prelockd",
         "Lock Screen Before Sleep In Progress",
-        "block"
+        "delay"
     );
 
     if (response < 0) {
-        pvprintf_error(&app->config, strcat("Failed to issue method call", error.message), -response);
+        pvprintf_error(&app->config, error.message, -response);
         sd_bus_error_free(&error);
         sd_bus_message_unref(m);
         return response;
@@ -239,19 +297,21 @@ static int lock_session(application_context_t *app) {
     sd_bus_message *m = NULL;
 
     int response = sd_bus_call_method(
-        app->bus,
-        "org.freedesktop.login1",
-        "/org/freedesktop/login1",
-        "org.freedesktop.login1.Manager",
-        "LockSession",
+        app->user_bus,
+        "org.kde.screensaver",
+        "/org/freedesktop/ScreenSaver",
+        "org.freedesktop.ScreenSaver",
+        "Lock",
         &error,
         &m,
-        "s",
-        app->session_id
+        NULL,
+        NULL
     );
 
+    pvprintf_info(&app->config, "Lock Request Sent");
+
     if (response < 0){
-        pvprintf_error(&app->config, strcat("Failed to issue method call", error.message), -response);
+        pvprintf_error(&app->config, error.message, -response);
         sd_bus_error_free(&error);
         sd_bus_message_unref(m);
         return response;
@@ -264,26 +324,31 @@ static int lock_session(application_context_t *app) {
 
 static int setup(application_context_t *app){
     config_t config;
-    config.lock_delay_ms = 100; //ms
-    config.timeout_ms = 1000; //ms
+    config.lock_delay_s = 1;
+    config.lock_delay_ms = 0;
+    config.timeout_s = 1;
+    config.timeout_ms = 0;
     config.verbose = TRUE;
 
     app->config = config;
 
-    const char *sid = getenv("XDG_SESSION_ID");
+    // char *sid = NULL;
 
-    if (!sid) {
-        pvprintf_error(&app->config, "XDG_SESSION_ID not set...", 1);
-        return 1;
-
-        // TODO: add handling for multiple sessions as well as a fallback using sd_pid_get_session
-    }
+    // int response = sd_pid_get_session(0, &sid);
+    // if (response < 0) {
+    //     pvprintf_error(&app->config, "Failed to get session", -response);
+    //     return 1;
+    // }
  
-    app->session_id = sid;
+    // app->session_id = sid;
     char *path = malloc(128);
-    snprintf(path, 128, "/org/freedesktop/login1/session/%s", sid);
+    snprintf(path, 128, "/org/freedesktop/login1/session/%s", "_31");
     app->session_path = path;
-    app->bus = NULL;
+    app->session_id = "1";
+
+    // get_active_session(app);
+    app->system_bus = NULL;
+    app->user_bus = NULL;
     app->state = STATE_ACQUIRE_INHIBITOR;
     app->inhibitor_lock_fd = -1;
 
@@ -293,15 +358,21 @@ static int setup(application_context_t *app){
 
     app->queue = queue;
 
-    int response = sd_bus_open_system(&app->bus);
+    int response = sd_bus_open_system(&app->system_bus);
     if (response < 0) {
         pvprintf_error(&app->config, "Failed to connect to system bus", -response);
         return 1;
     }
 
+    response = sd_bus_open_user(&app->user_bus);
+    if (response < 0) {
+        pvprintf_error(&app->config, "Failed to connect to user bus", -response);
+        return 1;
+    }
+
     // register a match rule for the PrepareForSleep signal
     response = sd_bus_match_signal(
-        app->bus,
+        app->system_bus,
         NULL,
         "org.freedesktop.login1",
         "/org/freedesktop/login1",
@@ -317,7 +388,7 @@ static int setup(application_context_t *app){
     }
 
     response = sd_bus_match_signal(
-        app->bus,
+        app->system_bus,
         NULL,
         "org.freedesktop.login1",
         app->session_path,
@@ -401,27 +472,31 @@ static void handle_signal(application_context_t *app, signal_t *s) {
 int main(int argc, char *argv[]) {
     application_context_t app = {0};
 
-    if (setup(&app) < 0) {
-        pvprintf_error(&app.config, "[ERROR] Failed to setup daemon", 1);
+    if (setup(&app) != 0) {
+        pvprintf_error(&app.config, "Failed to setup daemon", 1);
         return 1;
     }
 
+    openlog("prelockd", LOG_PID, LOG_USER);
+
     // the daemon event loop
     while(1) {
-        // process our DBus messages, trigger callbacks, enqueue/dequeue signals
-        sd_bus_process(app.bus, NULL);
-
-        // send new signals to handle_signals
-        signal_t signal;
-        while (dequeue_signal(&app.queue, &signal)){
-            handle_signal(&app, &signal);
+        while (sd_bus_process(app.system_bus, NULL) > 0) {
+            // send new signals to handle_signals
+            signal_t signal;
+            pvprintf_info(&app.config, "Signal Received!");
+            while (dequeue_signal(&app.queue, &signal)){
+                handle_signal(&app, &signal);
+            }
         }
 
-        sd_bus_wait(app.bus, (uint64_t)-1);
+        sd_bus_wait(app.system_bus, (uint64_t)-1);
     }
 
+    closelog();
+
     // clean up
-    sd_bus_unref(app.bus);
-    free(app.session_path);
+    sd_bus_unref(app.system_bus);
+    free((void *)app.session_path);
     return 0;
 }

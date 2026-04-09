@@ -52,9 +52,21 @@ typedef struct {
     uint64_t lock_request_time;
 } application_context_t;
 
-static void pvprintf(config_t *c, char *s[]) {
+static void pvprintf_state(config_t *c, char *s[]) {
     if (c->verbose) {
-        printf(s);
+        fprintf("[STATE] %s\n", s);
+    }
+}
+
+static void pvprintf_info(config_t *c, char *s[]) {
+    if (c->verbose) {
+        fprintf("[INFO] %s\n", s);
+    }
+}
+
+static void pvprintf_error(config_t *c, char *s[], int error) {
+    if (c->verbose) {
+        fprintf(stderr, "[ERROR] %s: %s\n", s, strerror(error));
     }
 }
 
@@ -72,7 +84,7 @@ static int max_signals_received(signal_queue_t *q) {
 // operation)
 static void enqueue_signal(signal_queue_t *q, signal_t s) {
     if (max_signals_received(q)) {
-        printf("Signal queue is full\n");
+        // printf("Signal queue is full\n");
         return;
     }
     q->signals[q->tail] = s;
@@ -83,7 +95,7 @@ static void enqueue_signal(signal_queue_t *q, signal_t s) {
 // operation)
 static int dequeue_signal(signal_queue_t *q, signal_t *s) {
     if (no_signals(q)) {
-        printf("Signal queue is empty\n");
+        // printf("Signal queue is empty\n");
         return 0;
     }
 
@@ -136,7 +148,7 @@ static int properties_changed_handler(sd_bus_message *m, void *userdata, sd_bus_
             sd_bus_message_exit_container(m); // exit variant
 
             if (locked) {
-                printf("Lock confirmed via signal\n");
+                pvprintf_info(&app->config, "Lock confirmed via signal");
 
                 enqueue_signal(&app->queue, SIGNAL_SESSION_LOCKED);
             }
@@ -160,7 +172,7 @@ static int prepare_for_sleep_handler(sd_bus_message *m, void *userdata, sd_bus_e
 
     response = sd_bus_message_read(m, "b", &sleeping);
     if (response < 0) {
-        fprintf(stderr, "Failed to parse parameters: %s\n", strerror(-response));
+        pvprintf_error(&app->config, "Failed to parse parameters", -response);
         return response;
     }
 
@@ -178,6 +190,10 @@ static int acquire_inhibitor(application_context_t *app) {
     sd_bus_message *m = NULL;
     int fd;
 
+    if (app->inhibitor_lock_fd >= 0) {
+        close(app->inhibitor_lock_fd);
+    }
+
     int response = sd_bus_call_method(
         app->bus,
         "org.freedesktop.login1",
@@ -194,7 +210,7 @@ static int acquire_inhibitor(application_context_t *app) {
     );
 
     if (response < 0) {
-        fprintf(stderr, "Failed to issue method call: %s\n", error.message);
+        pvprintf_error(&app->config, strcat("Failed to issue method call", error.message), -response);
         sd_bus_error_free(&error);
         sd_bus_message_unref(m);
         return response;
@@ -205,14 +221,14 @@ static int acquire_inhibitor(application_context_t *app) {
     // Read returned file descriptor
     response = sd_bus_message_read(m, "h", &fd);
     if (response < 0) {
-        fprintf(stderr, "Failed to parse inhibitor fd: %s\n", strerror(-response));
+        pvprintf_error(&app->config, "Failed to parse inhibitor fd", -response);
         sd_bus_message_unref(m);
         return response;
     }
 
     app->inhibitor_lock_fd = dup(fd);
 
-    printf("[INFO] Inhibitor acquired (fd=%d)\n", app->inhibitor_lock_fd);
+    pvprintf_info(&app->config, "Inhibitor acquired");
 
     sd_bus_message_unref(m);
     return 0;
@@ -235,7 +251,7 @@ static int lock_session(application_context_t *app) {
     );
 
     if (response < 0){
-        fprintf(stderr, "Failed to issue method call: %s\n", error.message);
+        pvprintf_error(&app->config, strcat("Failed to issue method call", error.message), -response);
         sd_bus_error_free(&error);
         sd_bus_message_unref(m);
         return response;
@@ -247,15 +263,22 @@ static int lock_session(application_context_t *app) {
 }
 
 static int setup(application_context_t *app){
+    config_t config;
+    config.lock_delay_ms = 100; //ms
+    config.timeout_ms = 1000; //ms
+    config.verbose = TRUE;
+
+    app->config = config;
+
     const char *sid = getenv("XDG_SESSION_ID");
 
     if (!sid) {
-        fprintf(stderr, "XDG_SESSION_ID not set...\n");
+        pvprintf_error(&app->config, "XDG_SESSION_ID not set...", 1);
         return 1;
 
         // TODO: add handling for multiple sessions as well as a fallback using sd_pid_get_session
     }
-
+ 
     app->session_id = sid;
     char *path = malloc(128);
     snprintf(path, 128, "/org/freedesktop/login1/session/%s", sid);
@@ -263,13 +286,6 @@ static int setup(application_context_t *app){
     app->bus = NULL;
     app->state = STATE_ACQUIRE_INHIBITOR;
     app->inhibitor_lock_fd = -1;
-
-    config_t config;
-    config.lock_delay_ms = 100; //ms
-    config.timeout_ms = 1000; //ms
-    config.verbose = FALSE;
-
-    app->config = config;
 
     signal_queue_t queue;
     queue.head = 0;
@@ -279,7 +295,7 @@ static int setup(application_context_t *app){
 
     int response = sd_bus_open_system(&app->bus);
     if (response < 0) {
-        fprintf(stderr, "Failed to connect to system bus: %s\n", strerror(-response));
+        pvprintf_error(&app->config, "Failed to connect to system bus", -response);
         return 1;
     }
 
@@ -296,7 +312,7 @@ static int setup(application_context_t *app){
     );
 
     if (response < 0) {
-        fprintf(stderr, "Failed to add match: %s\n", strerror(-response));
+        pvprintf_error(&app->config, "Failed to add match", -response);
         return 1;
     }
 
@@ -312,11 +328,13 @@ static int setup(application_context_t *app){
     );
 
     if (response < 0) {
-        fprintf(stderr, "Failed to add match: %s\n", strerror(-response));
+        pvprintf_error(&app->config, "Failed to add match", -response);
         return 1;
     }
 
-    printf("prelockd setup complete...");
+    pvprintf_info(&app->config, "prelockd setup complete...");
+
+    enqueue_signal(&app->queue, SIGNAL_ACQUIRE_INHIBITOR);
     return 0;
 }
 
@@ -326,13 +344,17 @@ static int setup(application_context_t *app){
  */
 static void handle_signal(application_context_t *app, signal_t *s) {
     switch (app->state) {
-        case STATE_ACQUIRE_INHIBITOR:        
-            acquire_inhibitor(app);
-            app->state = STATE_IDLE;
+        case STATE_ACQUIRE_INHIBITOR:
+            if (*s == SIGNAL_ACQUIRE_INHIBITOR) {
+                pvprintf_state(&app->config, "Transitioning to IDLE");
+                acquire_inhibitor(app);
+                app->state = STATE_IDLE;
+            }
 
             break;
         case STATE_IDLE:
             if (*s == SIGNAL_PREPARE_FOR_SLEEP) {
+                pvprintf_state(&app->config, "Transitioning to LOCK_REQUESTED");
                 lock_session(app);
                 app->state = STATE_LOCK_REQUESTED;
                 // TODO: add request timeout
@@ -341,6 +363,7 @@ static void handle_signal(application_context_t *app, signal_t *s) {
             break;
         case STATE_LOCK_REQUESTED:
             if (*s == SIGNAL_SESSION_LOCKED){
+                pvprintf_state(&app->config, "Transitioning to LOCK_CONFIRMED");
                 app->state = STATE_LOCK_CONFIRMED;
 
                 struct timespec ts;
@@ -354,6 +377,7 @@ static void handle_signal(application_context_t *app, signal_t *s) {
             break;
         case STATE_LOCK_CONFIRMED:
             if (*s == SIGNAL_TIMEOUT) {
+                pvprintf_state(&app->config, "Transitioning to RELEASE_INHIBITOR");
                 app->state = STATE_RELEASING_INHIBITOR;
                 close(app->inhibitor_lock_fd);
             }
@@ -361,6 +385,7 @@ static void handle_signal(application_context_t *app, signal_t *s) {
             break;
         case STATE_RELEASING_INHIBITOR:
             if (*s == SIGNAL_RESUME) {
+                pvprintf_state(&app->config, "Transitioning to ACQUIRE_INHIBITOR");
                 app->state = STATE_ACQUIRE_INHIBITOR;
                 enqueue_signal(&app->queue, SIGNAL_ACQUIRE_INHIBITOR);  // enqueue signal so that inhibitor will be acquired
             }
@@ -376,7 +401,10 @@ static void handle_signal(application_context_t *app, signal_t *s) {
 int main(int argc, char *argv[]) {
     application_context_t app = {0};
 
-    setup(&app);
+    if (setup(&app) < 0) {
+        pvprintf_error(&app.config, "[ERROR] Failed to setup daemon", 1);
+        return 1;
+    }
 
     // the daemon event loop
     while(1) {
@@ -394,5 +422,6 @@ int main(int argc, char *argv[]) {
 
     // clean up
     sd_bus_unref(app.bus);
+    free(app.session_path);
     return 0;
 }
